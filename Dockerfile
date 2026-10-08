@@ -1,4 +1,4 @@
-FROM nvidia/cuda:12.6.2-cudnn-devel-ubuntu24.04
+FROM nvidia/cuda:13.1.1-cudnn-devel-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHON_VERSION=3.12.7
@@ -27,7 +27,19 @@ WORKDIR /modded-nanogpt
 RUN python -m pip install --upgrade pip && \
     pip install -r requirements.txt
 
-RUN pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu126 --upgrade
+# [ANVIL2] The certified stack: pinned stable torch==2.10 from the cu128 wheel index, on a
+# CUDA-13 base (the attention kernel links libcudart.so.13; a 12.x base cannot run it).
+# The stock repo installed an unpinned nightly here; a nightly loads (the kernel is stable-ABI)
+# but its numerics are unpinned and have produced NaNs in reproduction attempts. Do not substitute.
+RUN pip install torch==2.10 --index-url https://download.pytorch.org/whl/cu128
+
+# The exact-match retrieval extension (exact_match/; Rust 1.89+, for its AVX-512 intrinsics), installed into
+# site-packages, so the repo mounted over /modded-nanogpt at run time does not hide it.
+RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.89.0
+ENV PATH=/root/.cargo/bin:$PATH
+COPY exact_match/Cargo.toml exact_match/Cargo.lock exact_match/pyproject.toml /modded-nanogpt/exact_match/
+COPY exact_match/src /modded-nanogpt/exact_match/src
+RUN pip install ./exact_match
 
 CMD ["bash"]
 ENTRYPOINT []

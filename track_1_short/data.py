@@ -15,16 +15,24 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
+from exact_match import HEADER_BYTES  # a shard file's header (256 int32), shared with the retrieval indexes
+
 from track_1_short.config import VIRTUAL_SEQ_CAP
 from track_1_short.model.layers import next_multiple_of_n
 from track_1_short.ngram_table import ngram_row_ids
 from track_1_short.perf.pinned_batches import PinnedBatchStaging
 from track_1_short.schedule import TrainingSchedule
 
-HEADER_BYTES = 256 * 4
-# Parallel pread threads for a shard read. The first training shard and every validation shard are read
-# on the clock; one thread's readinto leaves the page cache / disk bandwidth underused (record #360).
+# Parallel pread threads for a shard read. The first training shard is read on the clock; one thread's
+# readinto leaves the page cache / disk bandwidth underused (record #360).
 SHARD_READ_THREADS = 4
+# Tokens of the BOS index a Shard builds at once; the full index is scanned in the background.
+PARTIAL_INDEX_TOKENS = 6_000_000
+# Tokens of the timed loader's first shard read before step 0's batch is cut, the rest in the background: the partial
+# index's and some margin (the first ~45 steps). The whole 100M-token shard read cost step 0 ~60-110 ms on the 2 cores
+# a rank keeps beside its build cores.
+FIRST_READ_TOKENS = 8_000_000
+assert FIRST_READ_TOKENS >= PARTIAL_INDEX_TOKENS, "the partial BOS index must lie within the first read"
 
 
 def pread_parallel(fd: int, out: np.ndarray, offset: int, nbytes: int) -> int:
@@ -47,18 +55,31 @@ def pread_parallel(fd: int, out: np.ndarray, offset: int, nbytes: int) -> int:
         return sum(pool.map(read_range, edges, edges[1:]))
 
 
-def _load_data_shard(file: Path, buf: Tensor | None = None):
-    """`buf`: a pinned shard slot of the timed loader, filled in place of a fresh pinned allocation."""
+def _load_data_shard(file: Path, buf: Tensor | None = None, first: int | None = None):
+    """`buf`: a pinned shard slot of the timed loader, filled in place of a fresh pinned allocation. `first`: read only
+    the first this many tokens now. Returns the tokens and a function reading the rest (None if all are read)."""
     header = torch.from_file(str(file), False, 256, dtype=torch.int32) # header is 256 int32
     assert header[0] == 20240520, "magic number mismatch in the data .bin file"
     assert header[1] == 1, "unsupported version"
     num_tokens = int(header[2]) # number of tokens (claimed)
-    with file.open("rb", buffering=0) as f:
-        tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True) if buf is None else buf[:num_tokens] # avoid pin_memory copy by @YouJiacheng
+    tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True) if buf is None else buf[:num_tokens] # avoid pin_memory copy by @YouJiacheng
+    f = file.open("rb", buffering=0)
+    assert os.fstat(f.fileno()).st_size >= HEADER_BYTES + 2 * num_tokens, "number of tokens read does not match header"
+
+    def read(lo: int, hi: int):
         # straight into the array: avoids a bytes->array copy (@YouJiacheng)
-        nbytes = pread_parallel(f.fileno(), tokens.numpy(), HEADER_BYTES, 2 * num_tokens)
-        assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
-    return tokens
+        nbytes = pread_parallel(f.fileno(), tokens[lo:hi].numpy(), HEADER_BYTES + 2 * lo, 2 * (hi - lo))
+        assert nbytes == 2 * (hi - lo), "number of tokens read does not match header"
+
+    split = num_tokens if first is None else min(first, num_tokens)
+    def read_rest():
+        with f:
+            read(split, num_tokens)
+    read(0, split)
+    if split == num_tokens:
+        f.close()
+        return tokens, None
+    return tokens, read_rest
 
 BOS_ID = 50256
 
@@ -71,10 +92,11 @@ class Batch(NamedTuple):
     ngram_ids_cpu: np.ndarray  # the same, host: the row-pull want lists are built from it
     targets_cpu: Tensor    # host copy: the sampled-softmax candidate build reads targets without a D2H
     inputs_cpu: np.ndarray  # host copy: the value_embeds row-pull want lists are built from it
-    docs: tuple | None = None  # (shard tokens, every rank's document starts, ends): checked against the online retrieval plan
+    docs: tuple | None = None  # (shard size, every rank's document starts, ends): checked against the online retrieval plan
 
-# Rows of the packed cu_seqlens table per local batch size (tokens per rank); 40960 is the batch-20 taper.
-TRAIN_MAX_NUM_DOCS = {16384: 64, 32768: 96, 40960: 128, 49152: 128}
+# Rows of the packed cu_seqlens table per local batch size (tokens per rank): batch 8, the only training size (record
+# #360's value for it). Other sizes (validation) take the formula in cu_seqlens_rows.
+TRAIN_MAX_NUM_DOCS = {16384: 64}
 
 
 def cu_seqlens_rows(tokens_per_rank: int) -> int:
@@ -83,21 +105,28 @@ def cu_seqlens_rows(tokens_per_rank: int) -> int:
     return TRAIN_MAX_NUM_DOCS.get(tokens_per_rank, next_multiple_of_n(tokens_per_rank // 300, n=128))
 
 class Shard:
-    def __init__(self, tokens: Tensor, world_size: int = 1):
+    def __init__(self, tokens: Tensor, world_size: int = 1, read_rest=None):
+        # read_rest: reads the tokens past the first FIRST_READ_TOKENS (_load_data_shard), in the background
         self.tokens = tokens
         self.size = tokens.numel()
         self.world_size = world_size
         self.i = 0
+        self.read_all = threading.Event()  # every token is in
 
-        # Partial index now, full index async
-        self.bos_idx = (tokens[:6_000_000] == BOS_ID).nonzero(as_tuple=True)[0].to(torch.int64).cpu().numpy()
+        # Partial index now, full index async (numpy: ~4x faster than torch's nonzero, whose 190 ms full scan ran out
+        # the partial index at step ~27 and stalled every rank)
+        self.bos_idx = np.flatnonzero(tokens[:PARTIAL_INDEX_TOKENS].numpy() == BOS_ID)
         self._full_idx = None
         self._ready = threading.Event()
-        self._loader_thread = threading.Thread(target=self._scan)
+        self._loader_thread = threading.Thread(target=self._scan, args=(read_rest,))
         self._loader_thread.start()
 
-    def _scan(self):
-        self._full_idx = (self.tokens == BOS_ID).nonzero(as_tuple=True)[0].to(torch.int64).cpu().numpy()
+    def _scan(self, read_rest):
+        # The rest is read only now: a read beside the partial index's scan slowed it ~5x on a rank's 2 spare cores
+        if read_rest is not None:
+            read_rest()
+        self.read_all.set()
+        self._full_idx = np.flatnonzero(self.tokens.numpy() == BOS_ID)
         self._ready.set()
 
     def _maybe_switch(self):
@@ -133,6 +162,10 @@ class Shard:
 
             assert cur_len == num_tokens_local + 1
         self.i = idx
+        # The partial index's documents end within the first read; past it, wait for the rest (the full index already
+        # did: its scan follows the read). The last rank's last document ends furthest.
+        if ends[-1][-1] > FIRST_READ_TOKENS:
+            self.read_all.wait()
         return starts, ends
 
     @staticmethod
@@ -141,8 +174,8 @@ class Shard:
         result = {}
         ready = threading.Event()
         def load():
-            tokens = _load_data_shard(file, buf)
-            result['shard'] = Shard(tokens, world_size)
+            tokens, read_rest = _load_data_shard(file, buf)
+            result['shard'] = Shard(tokens, world_size, read_rest)
             ready.set()
         thread = threading.Thread(target=load)
         thread.start()
@@ -175,12 +208,19 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
     file_iter = iter(files)  # Use itertools.cycle(files) for multi-epoch training
     slots = itertools.cycle(shard_slots) if shard_slots else None
     next_slot = lambda: next(slots) if slots else None
-    tokens = _load_data_shard(next(file_iter), next_slot())
     if align_to_bos:
-        shard = Shard(tokens, world_size)
+        # Step 0's batch waits only for the first FIRST_READ_TOKENS; the rest of the shard is read in the background.
+        tokens, read_rest = _load_data_shard(next(file_iter), next_slot(), first=FIRST_READ_TOKENS)
+        shard = Shard(tokens, world_size, read_rest)
         next_shard_getter = Shard.load_async(next(file_iter), world_size, next_slot())
     else:
-        pos = 0  # for unaligned case
+        # unaligned case: each rank reads just its slice of each batch from the one shard
+        assert len(files) == 1, f"the unaligned loader reads one shard, found {len(files)}"
+        header = np.fromfile(files[0], "<i4", 256)
+        assert header[0] == 20240520 and header[1] == 1, "magic number or version mismatch in the data .bin file"
+        assert os.path.getsize(files[0]) == HEADER_BYTES + 2 * int(header[2]), "number of tokens does not match header"
+        shard_tokens = int(header[2])
+        pos = 0
 
     while True:
         num_tokens_local = num_tokens // world_size
@@ -205,17 +245,15 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
             _targets = buf[1:]
             end_idxs[-1] -= 1  # last document was too long to account for _targets offset
             cum_lengths = (end_idxs - start_idxs).cumsum(0)
-            docs = (tokens.numpy(), seq_starts, seq_ends)
+            docs = (shard.size, seq_starts, seq_ends)
             if max_seq_len > VIRTUAL_SEQ_CAP:
                 cum_lengths = split_attention_segments(cum_lengths, VIRTUAL_SEQ_CAP)
                 assert len(cum_lengths) < max_num_docs, f"{len(cum_lengths)} attention segments overflow the {max_num_docs}-row cu_seqlens table"
 
         else:
-            if pos + num_tokens + 1 >= len(tokens):  # should not occur for val data
-                tokens, pos = _load_data_shard(next(file_iter), next_slot()), 0
-
+            assert pos + num_tokens + 1 <= shard_tokens, "the unaligned loader ran past the end of its shard"
             pos_local = pos + rank * num_tokens_local
-            buf = tokens[pos_local: pos_local + num_tokens_local + 1]
+            buf = torch.from_numpy(np.fromfile(files[0], "<u2", num_tokens_local + 1, offset=HEADER_BYTES + 2 * pos_local))
             _inputs = buf[:-1].view(num_tokens_local, )
             _targets = buf[1:].view(num_tokens_local, )
 

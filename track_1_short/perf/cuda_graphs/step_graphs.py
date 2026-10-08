@@ -70,8 +70,7 @@ class StaticInputs:
     ret: Tensor
 
     def buffers(self):
-        return (self.inputs, self.targets, self.cum_seqlens, self.ngram_slots, self.mtp_weights, self.prefix_weight,
-                self.ret)
+        return (self.inputs, self.targets, self.cum_seqlens, self.ngram_slots, self.mtp_weights, self.prefix_weight, self.ret)
 
 
 def step_inputs(batch: Batch, ngram_slots: Tensor, cfg: ForwardScheduleConfig, ret: Tensor):

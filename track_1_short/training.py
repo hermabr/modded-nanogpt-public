@@ -54,32 +54,34 @@ class TrainingManager():
         # - Ordering dictates when to launch reduce/reduce_scatter operations
         # - "sharded" parameters use reduce_scatter/all_gather and "replicated" ones use all_reduce
         # - lr_mul and wd_mul are per-parameter learning rate and weight decay multipliers
+        # - tuned here: qk_bank, lm_head and embed at lr x1.22, mudd_w1 and mudd_gate_w1 at lr x2. ANVIL's weight
+        #   decay scales with the lr but not lr_mul, so qk_bank's wd_mul carries its 1.22 too.
         self.param_table = {
-            "qk_bank":        {"optim": "anvil",   "comms": "sharded",    "adam_betas": None},
+            "qk_bank":        {"optim": "anvil",   "comms": "sharded",    "adam_betas": None, "lr_mul": 1.22, "wd_mul": 1.22},
             "vo_bank":        {"optim": "anvil",   "comms": "sharded",    "adam_betas": None},
             "mlp_bank":       {"optim": "anvil",   "comms": "sharded",    "adam_betas": None},
             "scalars":        {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 5.0,  "wd_mul": 0.0},
             "smear_gate":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.01, "wd_mul": 0.0},
             "ve_gate_bank":   {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
-            "lm_head":        {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
+            "lm_head":        {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "lr_mul": 1.22, "wd_mul": 150.},
             "post_lambdas":   {"optim": "adam",    "comms": "replicated",     "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
             "resid_lambdas":  {"optim": "adam",    "comms": "replicated",     "adam_betas": [0.9,  0.95], "lr_mul": 5.0,  "wd_mul": 0.0},
             "value_embeds":   {"optim": "adam",    "comms": "sharded",    "adam_betas": list(VALUE_EMBED_BETAS), "lr_mul": VALUE_EMBED_LR_MUL, "wd_mul": VALUE_EMBED_WD_MUL},
-            "embed":          {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
+            "embed":          {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "lr_mul": 1.22, "wd_mul": 150.},
         }
 
         # ---- MUDD parameter overrides ----
         self.param_table.update({
-            "mudd_w1":    {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.25},
+            "mudd_w1":    {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.5},
             "mudd_w2":    {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.25},
             "mudd_w2g":   {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.25},
             "mudd_b2":    {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.25, "wd_mul": 0.0},
-            "mudd_gate_w1": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.1},
+            "mudd_gate_w1": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.2},
             "mudd_gate_w2": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.1},
             "mudd_gate_b2": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.1, "wd_mul": 0.0},
             "_mudd_gate_scale": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.1, "wd_mul": 0.0},
         })
-        # ---- exact-match retrieval: the scales at 10x lr ----
+        # ---- exact-match retrieval: the scales at 10x lr (tuned with their warm inits, model/gpt.py) ----
         ret_labels = [p.label for p in model.parameters() if p.label.startswith("ret_")]
         self.param_table.update({label: {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99],
                                          "lr_mul": 10.0 if "scale" in label else 1.0, "wd_mul": 0.0} for label in ret_labels})
@@ -120,7 +122,7 @@ class TrainingManager():
             lr=0.023,
             momentum=0.95,      # Nesterov lookahead; get_rail_beta rewrites it every step
             beta2=0.9,          # lane-energy EMA decay for the equalizer
-            weight_decay=2.25,
+            weight_decay=3.15,  # tuned: record #360's 2.25 x1.4
         )
 
         self.optimizer = AnvilAndAdam(

@@ -1,48 +1,49 @@
 # Exact-match retrieval record statistics (this PR)
 
-- code: commit `9fd046d`, 610 trained steps (schedule default `KX_STEPS=538`)
-- GPUs: 8x H100 80GB HBM3 (driver 580.173.02), Nebius on-demand VM `8gpu-128vcpu-1600gb`
+- code: commit `9025a886`, 570 trained steps (560 scheduled + 10 extension); validation index over the first 350 training shards
+- GPUs: 8x H100 80GB HBM3 (driver 580.173.02), Nebius on-demand VM `8gpu-128vcpu-1600gb` (Intel Xeon Platinum 8468, 128 threads, 1575 GiB)
 - Python `3.12.3` · PyTorch `2.10.0+cu128` · Triton `3.6.0` · kernels `0.16.1` · huggingface-hub `1.29.0` · CUDA runtime 13.0
-- protocol: one session (2026-10-01 04:02-05:27 UTC), legs interleaved baseline, this PR, this PR (x9); `KX_SEED` = seed column; before every leg: no stray processes, `/dev/shm` emptied, GPU memory back to 0, all 103 train shards + val shard re-read into page cache (warm), compile caches kept (compilation is untimed)
-- runs: `18`, all counted; all 18 raw logs ship in this folder
+- data: FineWeb-100B (`data/fineweb100B`), validated on its `fineweb_val_000000.bin`
+- protocol: one session (2026-10-08 01:36-03:25 UTC), legs interleaved this PR, this PR, baseline (x8); `TRAIN_SEED` = seed column; before every leg: no stray processes, `/dev/shm` emptied, GPU memory back to 0, train shards 1-350 + val shard re-read into page cache (warm), compile caches kept (compilation is untimed)
+- runs: `16`, all counted; all 16 raw logs ship in this folder. The session was restarted once, after two legs at the parent commit `847833fa`, to add the validation index build time to the log; those legs are not included.
 
 | metric | value |
 | --- | ---: |
-| mean wall (train_time) | 21.555 s |
-| wall sample std | 0.026 s |
-| wall range | 21.508-21.611 s |
-| mean val loss | 3.2748944444 |
-| val loss sample std | 0.0026059823 |
-| t-statistic vs 3.28 gate (one-sided) | 8.31 |
-| one-sided p vs 3.28 gate | 1.08e-07 |
+| mean wall (train_time) | 7.065 s |
+| wall sample std | 0.013 s |
+| wall range | 7.042-7.092 s |
+| mean val loss | 3.2760125000 |
+| val loss sample std | 0.0037489332 |
+| t-statistic vs 3.28 gate (one-sided) | 4.25 |
+| one-sided p vs 3.28 gate | 3.46e-04 |
 
-Against the baseline legs of the same session (`../baseline/`, ANVIL2, n=9):
+Against the baseline legs of the same session (`../baseline/`, ANVIL2, n=8):
 
 | metric | value |
 | --- | ---: |
-| mean wall difference | -18.447 s (-46.1%) |
-| Welch t-test on wall, two-sided p | 1.3e-30 |
-| mean val loss difference | -0.00437 |
+| mean wall difference | -33.235 s (-82.5%) |
+| Welch t-test on wall, two-sided p | 2.8e-21 |
+| mean val loss difference | -0.00745 |
 
 ## Runs (session order)
 
-| leg | seed | log | steps | final val loss | train_time |
-| ---: | ---: | --- | ---: | ---: | ---: |
-| 2 | 0 | `a86cf524-67e6-4329-b9ad-f982f28b25cd.txt` | 610 | 3.2749 | 21.569 s |
-| 3 | 1 | `372ac1b0-eac2-41cb-850a-0f55294a017f.txt` | 610 | 3.2768 | 21.532 s |
-| 5 | 2 | `b3b13aa2-98a1-4b12-af3a-dd68d7d116ce.txt` | 610 | 3.2740 | 21.508 s |
-| 6 | 3 | `2d896dfe-3916-491d-92bb-102b55c91555.txt` | 610 | 3.2763 | 21.525 s |
-| 8 | 4 | `cee2c869-4b70-44db-abee-c92d4d128c80.txt` | 610 | 3.2720 | 21.551 s |
-| 9 | 5 | `d1008e11-cceb-4996-a35b-7b25fcb87d4c.txt` | 610 | 3.2829 | 21.566 s |
-| 11 | 6 | `9a167c05-257e-495a-9f95-d8cc025f88c5.txt` | 610 | 3.2743 | 21.551 s |
-| 12 | 7 | `28d2300c-eb28-40b1-bfee-dbaa7ff652ce.txt` | 610 | 3.2727 | 21.569 s |
-| 14 | 8 | `26640c36-6c59-4995-8838-3710f9637024.txt` | 610 | 3.2722 | 21.536 s |
-| 15 | 9 | `744fc180-e798-4bca-8b2a-044bc8ff7365.txt` | 610 | 3.2741 | 21.578 s |
-| 17 | 10 | `1af907a4-98e1-420b-9734-df1f9a861b4e.txt` | 610 | 3.2716 | 21.574 s |
-| 18 | 11 | `dc0f810f-495e-43c9-8832-00eb3826f76c.txt` | 610 | 3.2767 | 21.565 s |
-| 20 | 12 | `58dd1502-4fcc-49f5-aa26-f359ff0dbafb.txt` | 610 | 3.2747 | 21.530 s |
-| 21 | 13 | `02180729-2664-42c9-820b-cdf50d6d6fb4.txt` | 610 | 3.2743 | 21.611 s |
-| 23 | 14 | `725b017a-fbd1-4672-81d4-92c8ddf05ea9.txt` | 610 | 3.2737 | 21.552 s |
-| 24 | 15 | `62b7100d-76d8-4673-87ae-4654450b186c.txt` | 610 | 3.2741 | 21.574 s |
-| 26 | 16 | `1e3b0248-e054-44ee-945a-6a56b7a04a36.txt` | 610 | 3.2753 | 21.520 s |
-| 27 | 17 | `62a1034e-2bfa-4a30-baa4-046442ea64f3.txt` | 610 | 3.2775 | 21.571 s |
+The last column is when the validation index was ready, from the start of the clock (from the log's `validation index built` line).
+
+| leg | seed | log | steps | final val loss | train_time | val index ready |
+| ---: | ---: | --- | ---: | ---: | ---: | ---: |
+| 1 | 0 | `d72ca4ea-5d6d-4f67-ab17-42ec832a7977.txt` | 570 | 3.2763 | 7.042 s | 6.48 s |
+| 2 | 1 | `4d07bb5d-1e02-45cb-adc3-b5d549c6d142.txt` | 570 | 3.2759 | 7.070 s | 6.43 s |
+| 4 | 2 | `010406bc-3554-4f21-822a-9bdd4c66b944.txt` | 570 | 3.2744 | 7.056 s | 6.45 s |
+| 5 | 3 | `60f3e405-b03b-4928-ae56-faac37f41bd6.txt` | 570 | 3.2809 | 7.053 s | 6.46 s |
+| 7 | 4 | `7773a1ab-c2a6-4650-abe4-775828a8d286.txt` | 570 | 3.2776 | 7.058 s | 6.42 s |
+| 8 | 5 | `f53d5135-1e83-4085-8b6c-1b9855035cd7.txt` | 570 | 3.2717 | 7.073 s | 6.44 s |
+| 10 | 6 | `2cfb6c3b-9443-4acd-8103-b6a0bb16c3ea.txt` | 570 | 3.2829 | 7.068 s | 6.42 s |
+| 11 | 7 | `b2ceafe9-12b6-4e87-9e28-d215d54b0808.txt` | 570 | 3.2761 | 7.064 s | 6.48 s |
+| 13 | 8 | `a261496e-acf4-4c8a-9053-6ec1044e1653.txt` | 570 | 3.2714 | 7.092 s | 6.46 s |
+| 14 | 9 | `ce955a0f-567a-402f-aee7-1c56912b2817.txt` | 570 | 3.2752 | 7.056 s | 6.49 s |
+| 16 | 10 | `9aa4be30-d0c1-49f5-833b-3ec7e8f10821.txt` | 570 | 3.2825 | 7.044 s | 6.46 s |
+| 17 | 11 | `8ce10159-2031-467b-9563-4b337785bb51.txt` | 570 | 3.2705 | 7.082 s | 6.45 s |
+| 19 | 12 | `78b4be94-5141-4d9f-bbb2-b66a7072e21a.txt` | 570 | 3.2786 | 7.060 s | 6.48 s |
+| 20 | 13 | `51061197-7945-4bdf-b432-019441bab98e.txt` | 570 | 3.2727 | 7.068 s | 6.54 s |
+| 22 | 14 | `331547ad-57f9-44cd-a9e6-a0aa6ec191e4.txt` | 570 | 3.2743 | 7.077 s | 6.47 s |
+| 23 | 15 | `e199ae79-688d-49db-9326-5f77b926b161.txt` | 570 | 3.2752 | 7.074 s | 6.49 s |
